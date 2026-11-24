@@ -36,9 +36,8 @@
   .chip.bad { background: #7f1d1d; color: #fee2e2; }
 
   .viewer { position: relative; flex: 1; min-height: 160px; border-radius: 18px; overflow: hidden; background: #000; }
-  .viewer video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .frame { position: absolute; inset: 5% 7%; border: 3px solid rgba(255,255,255,.9); border-radius: 14px;
-    box-shadow: 0 0 0 999px rgba(0,0,0,.25); pointer-events: none; }
+  /* contain, not cover: he sees exactly what the photo will have, nothing cropped off */
+  .viewer video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   .tip { position: absolute; left: 0; right: 0; bottom: 12px; text-align: center; font-weight: 700;
     text-shadow: 0 1px 4px #000; pointer-events: none; }
   .nocam { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
@@ -50,6 +49,8 @@
   .torch { position: absolute; top: 10px; right: 10px; width: 48px; height: 48px; border-radius: 50%;
     border: 0; background: rgba(0,0,0,.55); color: #fff; font-size: 22px; }
   .torch.on { background: #facc15; color: #000; }
+  .lens { position: absolute; top: 10px; left: 10px; height: 48px; padding: 0 14px; border-radius: 24px;
+    border: 0; background: rgba(0,0,0,.55); color: #fff; font-size: 15px; font-weight: 800; }
 
   .banner { border-radius: 14px; padding: 10px 12px; background: #7f1d1d; color: #fee2e2; font-size: 15px; }
   .banner b { display: block; font-size: 16px; }
@@ -115,11 +116,11 @@
 
   <div class="viewer" id="viewer">
     <video id="video" playsinline muted autoplay></video>
-    <div class="frame" id="frame" hidden></div>
     <div class="tip" id="tip" hidden>Tap anywhere to scan</div>
     <div class="nocam" id="nocam"><div class="big">📷</div><div id="nocamMsg">Starting camera…</div></div>
     <div class="flash" id="flash"></div>
     <button class="torch" id="torch" type="button" hidden aria-label="Torch">🔦</button>
+    <button class="lens" id="lens" type="button" hidden aria-label="Switch lens">🔄 Lens</button>
   </div>
 
   <div class="banner" id="banner" hidden></div>
@@ -160,24 +161,25 @@
   'use strict';
 
   // ── Fill these two in (setup steps 3–5 at the top of Scanner.gs) ──
-  var API_URL = 'https://script.google.com/macros/s/AKfycbzx4LxhM01HXnS4HOJCrOO0BGGxeB9jfN8e65ClUYWYrt2769gEYc8fJoIh6hQCPhUB/exec';   // Apps Script → Deploy → Web app URL, ends in /exec
-  var APP_KEY = 'f2d6e845a4e040d0';   // from the scannerSetup log
+  var API_URL = '';   // Apps Script → Deploy → Web app URL, ends in /exec
+  var APP_KEY = '';   // from the scannerSetup log
 
-  var MAX_SIDE = 1600;                         // photo size sent for reading
-  var QUALITY = 0.82;
+  var MAX_SIDE = 2048;                         // photo size sent for reading (the full camera picture)
+  var QUALITY = 0.8;
   var PARALLEL = 3;                            // photos sent at the same time
   var RETRY_MS = [3000, 8000, 20000, 45000];   // automatic resends after a dropped connection
   var configured = /^https?:\/\/\S+$/.test(API_URL) && !!APP_KEY;
 
   var $ = function (id) { return document.getElementById(id); };
   var el = {};
-  ['status', 'today', 'viewer', 'video', 'frame', 'tip', 'nocam', 'nocamMsg', 'flash', 'torch', 'banner', 'now',
+  ['status', 'today', 'viewer', 'video', 'tip', 'nocam', 'nocamMsg', 'flash', 'torch', 'lens', 'banner', 'now',
    'btnScan', 'btnPhoto', 'btnType', 'all', 'allEmpty', 'earlier', 'earlierEmpty', 'file', 'typeSheet', 'typeForm',
    'typeInput', 'typeCancel'].forEach(function (id) { el[id] = $(id); });
 
   var jobs = [];            // newest first
   var earlier = [];
   var stream = null, camMode = 'starting', torchOn = false, pendingPhoto = false, lastTap = 0;
+  var lenses = [], LENS_KEY = 'grmoto-scanner-lens';
   var audio = null, wakeLock = null;
 
   // ───────── talking to Apps Script ─────────
@@ -292,25 +294,70 @@
   })();
 
   // ───────── camera ─────────
-  function startCamera() {
+  function savedLens() { try { return localStorage.getItem(LENS_KEY) || ''; } catch (e) { return ''; } }
+  function saveLens(id) { try { if (id) localStorage.setItem(LENS_KEY, id); else localStorage.removeItem(LENS_KEY); } catch (e) {} }
+
+  function startCamera(deviceId) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { photoMode(''); return; }
-    navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-    }).then(function (s) {
+    var id = deviceId || savedLens();
+    // 4:3 is the camera's full picture; 16:9 trims it and looks zoomed in.
+    var video = { width: { ideal: 1920 }, height: { ideal: 1440 }, aspectRatio: { ideal: 4 / 3 } };
+    if (id) video.deviceId = { exact: id }; else video.facingMode = { ideal: 'environment' };
+    navigator.mediaDevices.getUserMedia({ audio: false, video: video }).then(function (s) {
       stream = s;
       el.video.srcObject = s;
       var p = el.video.play();
       if (p && p.catch) p.catch(function () {});
       camMode = 'live';
       el.nocam.hidden = true;
-      el.frame.hidden = el.tip.hidden = false;
-      try {
-        var caps = s.getVideoTracks()[0].getCapabilities ? s.getVideoTracks()[0].getCapabilities() : {};
-        el.torch.hidden = !caps.torch;
-      } catch (e) { el.torch.hidden = true; }
-    }).catch(function (e) { photoMode(e && e.name); });
+      el.tip.hidden = false;
+      var track = s.getVideoTracks()[0];
+      var caps = {};
+      try { caps = track.getCapabilities ? track.getCapabilities() : {}; } catch (e) {}
+      el.torch.hidden = !caps.torch;
+      if (caps.zoom && typeof caps.zoom.min === 'number') {          // some Android phones open slightly zoomed
+        track.applyConstraints({ advanced: [{ zoom: caps.zoom.min }] }).catch(function () {});
+      }
+      findLenses(track);
+    }).catch(function (e) {
+      if (id) { saveLens(''); startCamera(); return; }               // remembered lens gone: use the default
+      photoMode(e && e.name);
+    });
   }
+
+  // Phones with several back cameras sometimes open the telephoto (zoomed) or
+  // ultra-wide one. The Lens button steps through them; the choice is remembered.
+  function findLenses(track) {
+    if (!navigator.mediaDevices.enumerateDevices) return;
+    navigator.mediaDevices.enumerateDevices().then(function (list) {
+      lenses = list.filter(function (d) {
+        return d.kind === 'videoinput' && !/front|user|facetime|selfie/i.test(d.label);
+      });
+      el.lens.hidden = lenses.length < 2;
+      var settings = track.getSettings ? track.getSettings() : {};
+      var i = lenses.map(function (d) { return d.deviceId; }).indexOf(settings.deviceId);
+      el.lens.textContent = '🔄 Lens ' + (i + 1) + '/' + lenses.length;
+      // First time on this phone and it picked a telephoto lens: switch to a normal one.
+      if (!savedLens() && /tele/i.test(track.label)) {
+        var normal = lenses.filter(function (d) { return !/tele|ultra/i.test(d.label); })[0];
+        if (normal) useLens(normal.deviceId);
+      }
+    }).catch(function () {});
+  }
+
+  function useLens(id) {
+    saveLens(id);
+    stopCamera();
+    startCamera(id);
+  }
+
+  el.lens.addEventListener('click', function (ev) {
+    ev.stopPropagation();
+    if (lenses.length < 2) return;
+    var cur = stream && stream.getVideoTracks()[0].getSettings ? stream.getVideoTracks()[0].getSettings().deviceId : '';
+    var i = lenses.map(function (d) { return d.deviceId; }).indexOf(cur);
+    useLens(lenses[(i + 1) % lenses.length].deviceId);
+  });
 
   function stopCamera() {
     if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
@@ -322,7 +369,7 @@
   function photoMode(reason) {
     camMode = 'photo';
     el.nocam.hidden = false;
-    el.frame.hidden = el.tip.hidden = el.torch.hidden = true;
+    el.tip.hidden = el.torch.hidden = el.lens.hidden = true;
     el.nocamMsg.textContent = reason === 'NotAllowedError'
       ? 'Camera is blocked. Tap SCAN to use the phone camera, or allow the camera for this site in the browser settings.'
       : 'Tap SCAN to take a photo of the slip.';
@@ -451,9 +498,9 @@
   }
 
   function render() {
-    // On screen: anything not sent first, then the newest three.
+    // On screen: anything not sent first, then the newest two.
     var stuck = jobs.filter(function (j) { return j.state === 'failed'; });
-    var top = stuck.concat(jobs.filter(function (j) { return j.state !== 'failed'; })).slice(0, 3);
+    var top = stuck.concat(jobs.filter(function (j) { return j.state !== 'failed'; })).slice(0, 2);
     el.now.innerHTML = top.map(rowHtml).join('');
     el.all.innerHTML = jobs.map(rowHtml).join('');
     el.allEmpty.hidden = jobs.length > 0;
